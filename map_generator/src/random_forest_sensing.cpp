@@ -41,6 +41,7 @@ vector<double> _state;
 int _obs_num;
 double _x_size, _y_size, _z_size;
 double _x_l, _x_h, _y_l, _y_h, _w_l, _w_h, _h_l, _h_h;
+double _thin_h_l, _thin_h_h;
 double _z_limit, _sensing_range, _resolution, _sense_rate, _init_x, _init_y;
 double _min_dist;
 
@@ -49,6 +50,7 @@ bool _has_odom = false;
 
 int circle_num_;
 double radius_l_, radius_h_, z_l_, z_h_;
+double cyl_radius_l_, cyl_radius_h_;
 double theta_;
 uniform_real_distribution<double> rand_radius_;
 uniform_real_distribution<double> rand_radius2_;
@@ -154,16 +156,32 @@ void RandomMapGenerate() {
   _map_ok = true;
 }
 
+// 新增：生成地面点云（z = 0.0, 0.05, 0.1）
+void addGroundPlaneToMap() {
+  pcl::PointXYZ pt_ground;
+  const double ground_layers[] = {0.0, 0.05, 0.1};
+
+  for (double z : ground_layers) {
+    pt_ground.z = z;
+    for (double x = _x_l; x <= _x_h; x += _resolution) {
+      for (double y = _y_l; y <= _y_h; y += _resolution) {
+        pt_ground.x = x;
+        pt_ground.y = y;
+        cloudMap.points.push_back(pt_ground);
+      }
+    }
+  }
+}
+
 void RandomMapGenerateCylinder() {
   pcl::PointXYZ pt_random;
 
   vector<Eigen::Vector2d> obs_position;
+  uniform_real_distribution<double> rand_thin_h(_thin_h_l, _thin_h_h);
+  uniform_real_distribution<double> rand_cyl_radius(cyl_radius_l_, cyl_radius_h_);
 
   rand_x = uniform_real_distribution<double>(_x_l, _x_h);
   rand_y = uniform_real_distribution<double>(_y_l, _y_h);
-  rand_w = uniform_real_distribution<double>(_w_l, _w_h);
-  rand_h = uniform_real_distribution<double>(_h_l, _h_h);
-  rand_inf = uniform_real_distribution<double>(0.5, 1.5);
 
   rand_radius_ = uniform_real_distribution<double>(radius_l_, radius_h_);
   rand_radius2_ = uniform_real_distribution<double>(radius_l_, 1.2);
@@ -172,11 +190,10 @@ void RandomMapGenerateCylinder() {
 
   // generate polar obs
   for (int i = 0; i < _obs_num && ros::ok(); i++) {
-    double x, y, w, h, inf;
+    double x, y, h;
     x = rand_x(eng);
     y = rand_y(eng);
-    w = rand_w(eng);
-    inf = rand_inf(eng);
+    double radius = rand_cyl_radius(eng);
     
     bool flag_continue = false;
     for ( auto p : obs_position )
@@ -194,14 +211,13 @@ void RandomMapGenerateCylinder() {
     x = floor(x / _resolution) * _resolution + _resolution / 2.0;
     y = floor(y / _resolution) * _resolution + _resolution / 2.0;
 
-    int widNum = ceil((w*inf) / _resolution);
-    double radius = (w*inf) / 2;
+    int widNum = ceil((2.0 * radius) / _resolution);
 
     for (int r = -widNum / 2.0; r < widNum / 2.0; r++)
       for (int s = -widNum / 2.0; s < widNum / 2.0; s++) {
-        h = rand_h(eng);
+        h = rand_thin_h(eng);
         int heiNum = ceil(h / _resolution);
-        for (int t = -20; t < heiNum; t++) {
+        for (int t = 0; t < heiNum; t++) {
           double temp_x = x + (r + 0.5) * _resolution + 1e-2;
           double temp_y = y + (s + 0.5) * _resolution + 1e-2;
           double temp_z = (t + 0.5) * _resolution + 1e-2;
@@ -260,11 +276,142 @@ void RandomMapGenerateCylinder() {
     }
   }
 
+  // 新增：添加地面点云（z=0）
+  addGroundPlaneToMap();
+
   cloudMap.width = cloudMap.points.size();
   cloudMap.height = 1;
   cloudMap.is_dense = true;
 
   ROS_WARN("Finished generate random map ");
+
+  kdtreeLocalMap.setInputCloud(cloudMap.makeShared());
+
+  _map_ok = true;
+}
+
+void RandomMapGenerateMASMPC() {
+  pcl::PointXYZ pt_random;
+
+  struct CylinderInfo {
+    Eigen::Vector2d center;
+    double radius;
+  };
+  vector<CylinderInfo> cylinders;
+  uniform_real_distribution<double> rand_thin_h(_thin_h_l, _thin_h_h);
+  uniform_real_distribution<double> rand_cyl_radius(cyl_radius_l_, cyl_radius_h_);
+
+  rand_x = uniform_real_distribution<double>(_x_l, _x_h);
+  rand_y = uniform_real_distribution<double>(_y_l, _y_h);
+
+  rand_radius_ = uniform_real_distribution<double>(radius_l_, radius_h_);
+  rand_radius2_ = uniform_real_distribution<double>(radius_l_, 1.2);
+  rand_theta_ = uniform_real_distribution<double>(-theta_, theta_);
+  rand_z_ = uniform_real_distribution<double>(z_l_, z_h_);
+
+  int generated_num = 0;
+  int attempts = 0;
+  const int max_attempts = _obs_num * 200;
+
+  // generate cylinder obs with minimum surface-to-surface distance = _min_dist
+  while (generated_num < _obs_num && ros::ok() && attempts < max_attempts) {
+    attempts++;
+
+    double x, y, h;
+    x = rand_x(eng);
+    y = rand_y(eng);
+    double radius = rand_cyl_radius(eng);
+
+    x = floor(x / _resolution) * _resolution + _resolution / 2.0;
+    y = floor(y / _resolution) * _resolution + _resolution / 2.0;
+
+    bool too_close = false;
+    for (const auto& c : cylinders) {
+      const double center_dist = (Eigen::Vector2d(x, y) - c.center).norm();
+      if (center_dist < (radius + c.radius + _min_dist)) {
+        too_close = true;
+        break;
+      }
+    }
+    if (too_close) continue;
+
+    cylinders.push_back({Eigen::Vector2d(x, y), radius});
+    generated_num++;
+
+    int widNum = ceil((2.0 * radius) / _resolution);
+
+    for (int r = -widNum / 2.0; r < widNum / 2.0; r++)
+      for (int s = -widNum / 2.0; s < widNum / 2.0; s++) {
+        h = rand_thin_h(eng);
+        int heiNum = ceil(h / _resolution);
+        for (int t = 0; t < heiNum; t++) {
+          double temp_x = x + (r + 0.5) * _resolution + 1e-2;
+          double temp_y = y + (s + 0.5) * _resolution + 1e-2;
+          double temp_z = (t + 0.5) * _resolution + 1e-2;
+          if ((Eigen::Vector2d(temp_x, temp_y) - Eigen::Vector2d(x, y)).norm() <= radius) {
+            pt_random.x = temp_x;
+            pt_random.y = temp_y;
+            pt_random.z = temp_z;
+            cloudMap.points.push_back(pt_random);
+          }
+        }
+      }
+  }
+
+  if (generated_num < _obs_num) {
+    ROS_WARN("MASMPC map: only generated %d/%d cylinders under min_distance=%.3f",
+             generated_num, _obs_num, _min_dist);
+  }
+
+  // keep the same circle-obstacle generation behavior as RandomMapGenerateCylinder
+  for (int i = 0; i < circle_num_; ++i) {
+    double x, y, z;
+    x = rand_x(eng);
+    y = rand_y(eng);
+    z = rand_z_(eng);
+
+    x = floor(x / _resolution) * _resolution + _resolution / 2.0;
+    y = floor(y / _resolution) * _resolution + _resolution / 2.0;
+    z = floor(z / _resolution) * _resolution + _resolution / 2.0;
+
+    Eigen::Vector3d translate(x, y, z);
+
+    double theta = rand_theta_(eng);
+    Eigen::Matrix3d rotate;
+    rotate << cos(theta), -sin(theta), 0.0, sin(theta), cos(theta), 0.0, 0, 0,
+        1;
+
+    double radius1 = rand_radius_(eng);
+    double radius2 = rand_radius2_(eng);
+
+    Eigen::Vector3d cpt;
+    for (double angle = 0.0; angle < 6.282; angle += _resolution / 2) {
+      cpt(0) = 0.0;
+      cpt(1) = radius1 * cos(angle);
+      cpt(2) = radius2 * sin(angle);
+
+      Eigen::Vector3d cpt_if;
+      for (int ifx = -0; ifx <= 0; ++ifx)
+        for (int ify = -0; ify <= 0; ++ify)
+          for (int ifz = -0; ifz <= 0; ++ifz) {
+            cpt_if = cpt + Eigen::Vector3d(ifx * _resolution, ify * _resolution,
+                                           ifz * _resolution);
+            cpt_if = rotate * cpt_if + Eigen::Vector3d(x, y, z);
+            pt_random.x = cpt_if(0);
+            pt_random.y = cpt_if(1);
+            pt_random.z = cpt_if(2);
+            cloudMap.push_back(pt_random);
+          }
+    }
+  }
+
+  addGroundPlaneToMap();
+
+  cloudMap.width = cloudMap.points.size();
+  cloudMap.height = 1;
+  cloudMap.is_dense = true;
+
+  ROS_WARN("Finished generate MASMPC map ");
 
   kdtreeLocalMap.setInputCloud(cloudMap.makeShared());
 
@@ -756,10 +903,14 @@ int main(int argc, char** argv) {
   n.param("map/resolution", _resolution, 0.01);
   n.param("map/circle_num", circle_num_, 1);
 
-  n.param("ObstacleShape/lower_rad", _w_l, 0.3);
+  n.param("ObstacleShape/lower_rad", _w_l, 0.3); //障碍物横向尺寸
   n.param("ObstacleShape/upper_rad", _w_h, 0.8);
-  n.param("ObstacleShape/lower_hei", _h_l, 3.0);
+  n.param("ObstacleShape/lower_hei", _h_l, 3.0); //障碍物高度尺寸
   n.param("ObstacleShape/upper_hei", _h_h, 7.0);
+  n.param("ObstacleShape/thin_lower_hei", _thin_h_l, 0.2);
+  n.param("ObstacleShape/thin_upper_hei", _thin_h_h, 2.0);
+  n.param("ObstacleShape/cyl_radius_l", cyl_radius_l_, 0.25);
+  n.param("ObstacleShape/cyl_radius_h", cyl_radius_h_, 0.50);
 
   n.param("ObstacleShape/radius_l", radius_l_, 7.0);
   n.param("ObstacleShape/radius_h", radius_h_, 7.0);
@@ -790,7 +941,7 @@ int main(int argc, char** argv) {
   
   // RandomMapGenerateMRAC1();
   // RandomMapGenerateMRAC_EXP_Column();
-  RandomMapGenerateCylinder();
+  RandomMapGenerateMASMPC();
 
   // 在地图生成后调用保存函数
   saveMapToPCD();
